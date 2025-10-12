@@ -489,8 +489,16 @@ tab_overview, tab_transactions, tab_single = st.tabs(
 
 # Overview Tab
 with tab_overview:
-    st.title("Stocks Dashboard")
+    st.title("Stoncks Dashboard")
     st.caption("Buy high, sell low 🚀💰📈")
+    # Image on the right upper side (under the title/caption)
+    left_col_top, right_col_top = st.columns([3, 1])
+    with right_col_top:
+        img_path = os.path.join(DATA_DIR, "lib", "Stonks.jpg")
+        if os.path.exists(img_path):
+            st.image(img_path, caption="Stoncks")
+        else:
+            st.warning(f"Image not found: {os.path.relpath(img_path)}")
 
     with st.spinner("Fetching data..."):
         close = fetch_history(
@@ -507,6 +515,8 @@ with tab_overview:
     cols = [c1, c2, c3, c4]
     for i, (ticker, row) in enumerate(perf.itertuples()):
         cols[i % 4].metric(ticker, f"{row:.2f}%")
+
+    # (Image moved to top-right above)
 
     st.subheader("Variation")
     buys_list, sells_list = split_buys_sells_lists(st.session_state.transactions)
