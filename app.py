@@ -13,6 +13,40 @@ import numpy as np
 import yfinance as yf
 import streamlit as st
 
+# --- Helpers to split buys and sells for plotting ---
+from typing import Tuple
+
+def split_buys_sells_lists(tx: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    """Return (buys_list, sells_list) from the raw transactions.
+    - Buys: qty > 0
+    - Sells: qty < 0
+    Dates are parsed to datetime and made tz-naive to match price indices.
+    """
+    if not tx:
+        return [], []
+    df = pd.DataFrame(tx).copy()
+    if "ticker" not in df:
+        return [], []
+    df["ticker"] = df["ticker"].astype(str)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    # Drop timezone info so it matches df indices that are tz-naive
+    try:
+        if hasattr(pd, "DatetimeTZDtype") and isinstance(df["date"].dtype, pd.DatetimeTZDtype):  # type: ignore[attr-defined]
+            df["date"] = df["date"].dt.tz_convert(None)
+        else:
+            df["date"] = df["date"].dt.tz_localize(None)
+    except Exception:
+        pass
+    df["value"] = pd.to_numeric(df.get("value", df.get("price", 0.0)), errors="coerce").fillna(0.0)
+    df["qty"] = pd.to_numeric(df.get("qty", 0.0), errors="coerce").fillna(0.0)
+    df["currency"] = df.get("currency", "EUR").fillna("EUR").astype(str)
+
+    buys_df = df[df["qty"] > 0].copy()
+    sells_df = df[df["qty"] < 0].copy()
+
+    return buys_df.to_dict(orient="records"), sells_df.to_dict(orient="records")
+
+
 # === FX and quote currency helpers ===
 
 
@@ -233,9 +267,7 @@ def cost_basis_summary(transactions, last_prices) -> pd.DataFrame:
 
     rows = {}
     for ticker, tdf in df.groupby("ticker", sort=False):
-        quote_ccy = _get_quote_currency(ticker)
         tdf = tdf.sort_values("date", kind="stable")
-        qty = 0.0
         avg_cost = float('nan')
         for _, r in tdf.iterrows():
             q = float(r["qty"])
@@ -269,7 +301,7 @@ def cost_basis_summary(transactions, last_prices) -> pd.DataFrame:
             unreal = (last - (avg_cost if np.isfinite(avg_cost) else last)) * qty
             plpct = ((last / avg_cost) - 1.0) * 100.0 if (np.isfinite(avg_cost)
                                                           and avg_cost != 0) else float('nan')
-        rows[ticker] = {"Qty": qty, "Avg Cost €": avg_display,
+        rows[ticker] = {"Qty": qty, "Avg Cost": avg_display,
                         "Last": last, "Unrealized P/L": unreal, "P/L %": plpct}
     res = pd.DataFrame.from_dict(rows, orient="index")
     res.index.name = "Ticker"
@@ -278,43 +310,72 @@ def cost_basis_summary(transactions, last_prices) -> pd.DataFrame:
 # Plotly helpers
 
 
-def plot_indexed_plotly(norm: pd.DataFrame, buys: List[Dict], height: int = 360):
+
+def plot_indexed_plotly(norm: pd.DataFrame, buys: List[Dict], sells: List[Dict], height: int = 360):
     norm = norm.ffill()
     fig = go.Figure()
     for col in norm.columns:
-        fig.add_trace(go.Scatter(
-            x=norm.index, y=norm[col], mode="lines", name=col))
-    # Overlay buys per ticker
+        fig.add_trace(go.Scatter(x=norm.index, y=norm[col], mode="lines", name=col))
+
+    # Buys ▲
     if buys:
-        tx = pd.DataFrame(buys)
-        tx["date"] = pd.to_datetime(tx["date"], errors="coerce")
+        txb = pd.DataFrame(buys).copy()
+        txb["date"] = pd.to_datetime(txb["date"], errors="coerce")
         for ticker in norm.columns:
-            tdf = tx[tx["ticker"] == ticker]
+            tdf = txb[txb["ticker"] == ticker]
             if tdf.empty:
                 continue
-            # pick y from normalized series if date exists
-            y = norm[ticker].reindex(tdf["date"]).dropna()
-            if not y.empty:
+            yb = norm[ticker].reindex(tdf["date"]).dropna()
+            if not yb.empty:
+                mask = tdf["date"].isin(yb.index)
+                hb = [
+                    f"Date: {d.strftime('%Y-%m-%d')}<br>Qty: {q}<br>Price: {v} {c}"
+                    for d, q, v, c in zip(tdf.loc[mask, "date"], tdf.loc[mask, "qty"],
+                                          tdf.loc[mask, "value"], tdf.loc[mask, "currency"])
+                ]
                 fig.add_trace(go.Scatter(
-                    x=y.index, y=y.values, mode="markers", name=f"{ticker} buys",
-                    marker=dict(symbol="triangle-up", size=9,
-                                line=dict(width=1, color="black"))
+                    x=yb.index, y=yb.values, mode="markers", name=f"{ticker} buys",
+                    hovertext=hb, hoverinfo="text",
+                    marker=dict(symbol="triangle-up", size=9, line=dict(width=1, color="black"))
                 ))
+
+    # Sells ▼
+    if sells:
+        txs = pd.DataFrame(sells).copy()
+        txs["date"] = pd.to_datetime(txs["date"], errors="coerce")
+        for ticker in norm.columns:
+            tdf = txs[txs["ticker"] == ticker]
+            if tdf.empty:
+                continue
+            ys = norm[ticker].reindex(tdf["date"]).dropna()
+            if not ys.empty:
+                mask = tdf["date"].isin(ys.index)
+                hs = [
+                    f"Date: {d.strftime('%Y-%m-%d')}<br>Qty: {abs(q)}<br>Price: {v} {c}"
+                    for d, q, v, c in zip(tdf.loc[mask, "date"], tdf.loc[mask, "qty"],
+                                          tdf.loc[mask, "value"], tdf.loc[mask, "currency"])
+                ]
+                fig.add_trace(go.Scatter(
+                    x=ys.index, y=ys.values, mode="markers", name=f"{ticker} sells",
+                    hovertext=hs, hoverinfo="text",
+                    marker=dict(symbol="triangle-down", size=9, line=dict(width=1, color="black"))
+                ))
+
     fig.update_layout(
         height=height,
         margin=dict(l=10, r=10, t=40, b=10),
-        legend=dict(orientation="h", yanchor="bottom",
-                    y=1.02, xanchor="right", x=1),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         yaxis_title="Index",
         xaxis_title="Date",
     )
     fig.update_yaxes(type="linear")
     fig.update_xaxes(rangeslider=dict(visible=False))
-    st.plotly_chart(fig, use_container_width=True,
-                    config={"displaylogo": False})
+    st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
 
 
-def plot_candles_plotly(symbol: str, period="6mo", interval="1d", height: int = 520, buys: Optional[List[Dict]] = None):
+
+def plot_candles_plotly(symbol: str, period="6mo", interval="1d", height: int = 520,
+                        buys: Optional[List[Dict]] = None, sells: Optional[List[Dict]] = None):
     df = fetch_ohlc(symbol, period=period, interval=interval)
     if df.empty:
         st.info("No data for this period/interval.")
@@ -331,69 +392,86 @@ def plot_candles_plotly(symbol: str, period="6mo", interval="1d", height: int = 
         name=symbol
     ), row=1, col=1)
 
-    fig.add_trace(go.Scatter(x=df.index, y=ma20,
-                  mode="lines", name="MA20"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=ma50,
-                  mode="lines", name="MA50"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=ma20, mode="lines", name="MA20"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=ma50, mode="lines", name="MA50"), row=1, col=1)
 
-    # Buys overlay: map transaction dates to the nearest prior trading day and plot markers
+    # Buys overlay (▲)
     if buys:
-        tx = pd.DataFrame(buys)
-        tx["date"] = pd.to_datetime(tx["date"], errors="coerce")
-        tdf = tx[tx["ticker"] == symbol].copy()
-        if not tdf.empty:
-            # Align transaction dates to the previous available trading date in df
-            tx_dates = tdf["date"].to_numpy()
+        tb = pd.DataFrame(buys)
+        tb = tb[(tb["ticker"] == symbol)].copy()
+        if not tb.empty:
+            tb["date"] = pd.to_datetime(tb["date"], errors="coerce")
             try:
-                idxer = df.index.get_indexer(tx_dates, method="ffill")
+                idxer = df.index.get_indexer(tb["date"].to_numpy(), method="ffill")
             except Exception:
-                # Fallback: exact reindex if get_indexer isn't available for some index types
-                y = df["Close"].reindex(tdf["date"]).dropna()
+                y = df["Close"].reindex(tb["date"]).dropna()
                 if not y.empty:
                     fig.add_trace(go.Scatter(
                         x=y.index, y=y.values, mode="markers", name="Buys",
-                        marker=dict(symbol="triangle-up", size=10,
-                                    line=dict(width=1, color="black"))
+                        marker=dict(symbol="triangle-up", size=10, line=dict(width=1, color="black"))
                     ), row=1, col=1)
             else:
-                valid_mask = idxer != -1
-                if valid_mask.any():
-                    tdf_valid = tdf.iloc[valid_mask].copy()
-                    mapped_idx = df.index[idxer[valid_mask]]
-                    mapped_close = df["Close"].iloc[idxer[valid_mask]].values
-                    # Build hover text per transaction
-                    hover_texts = []
-                    qtys = tdf_valid.get(
-                        "qty", pd.Series([None] * len(tdf_valid)))
-                    vals = tdf_valid.get("value", tdf_valid.get(
-                        "price", pd.Series([None] * len(tdf_valid))))
-                    curs = tdf_valid.get(
-                        "currency", pd.Series([""] * len(tdf_valid)))
-                    for od, q, v, c in zip(tdf_valid["date"].dt.strftime("%Y-%m-%d"), qtys, vals, curs):
-                        hover_texts.append(
-                            f"Date: {od}<br>Qty: {q}<br>Price: {v} {c}")
+                valid = idxer != -1
+                if valid.any():
+                    mapped_idx = df.index[idxer[valid]]
+                    mapped_close = df["Close"].iloc[idxer[valid]].values
+                    hover_texts = [
+                        f"Date: {od}<br>Qty: {q}<br>Price: {v} {c}"
+                        for od, q, v, c in zip(
+                            tb.loc[valid, "date"].dt.strftime("%Y-%m-%d"),
+                            tb.loc[valid, "qty"], tb.loc[valid, "value"], tb.loc[valid, "currency"]
+                        )
+                    ]
                     fig.add_trace(go.Scatter(
                         x=mapped_idx, y=mapped_close, mode="markers", name="Buys",
                         hovertext=hover_texts, hoverinfo="text",
-                        marker=dict(symbol="triangle-up", size=10,
-                                    line=dict(width=1, color="black"))
+                        marker=dict(symbol="triangle-up", size=10, line=dict(width=1, color="black"))
                     ), row=1, col=1)
 
-    fig.add_trace(
-        go.Bar(x=df.index, y=df["Volume"], name="Volume"), row=2, col=1)
+    # Sells overlay (▼)
+    if sells:
+        ts = pd.DataFrame(sells)
+        ts = ts[(ts["ticker"] == symbol)].copy()
+        if not ts.empty:
+            ts["date"] = pd.to_datetime(ts["date"], errors="coerce")
+            try:
+                idxer = df.index.get_indexer(ts["date"].to_numpy(), method="ffill")
+            except Exception:
+                y = df["Close"].reindex(ts["date"]).dropna()
+                if not y.empty:
+                    fig.add_trace(go.Scatter(
+                        x=y.index, y=y.values, mode="markers", name="Sells",
+                        marker=dict(symbol="triangle-down", size=10, line=dict(width=1, color="black"))
+                    ), row=1, col=1)
+            else:
+                valid = idxer != -1
+                if valid.any():
+                    mapped_idx = df.index[idxer[valid]]
+                    mapped_close = df["Close"].iloc[idxer[valid]].values
+                    hover_texts = [
+                        f"Date: {od}<br>Qty: {abs(q)}<br>Price: {v} {c}"
+                        for od, q, v, c in zip(
+                            ts.loc[valid, "date"].dt.strftime("%Y-%m-%d"),
+                            ts.loc[valid, "qty"], ts.loc[valid, "value"], ts.loc[valid, "currency"]
+                        )
+                    ]
+                    fig.add_trace(go.Scatter(
+                        x=mapped_idx, y=mapped_close, mode="markers", name="Sells",
+                        hovertext=hover_texts, hoverinfo="text",
+                        marker=dict(symbol="triangle-down", size=10, line=dict(width=1, color="black"))
+                    ), row=1, col=1)
+
+    fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volume"), row=2, col=1)
 
     fig.update_layout(
         height=height,
         margin=dict(l=10, r=10, t=40, b=10),
         xaxis=dict(rangeslider=dict(visible=False)),
-        legend=dict(orientation="h", yanchor="bottom",
-                    y=1.02, xanchor="right", x=1),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
     fig.update_yaxes(title_text="Price", row=1, col=1)
     fig.update_yaxes(title_text="Volume", row=2, col=1)
-    # Use container width to avoid passing non-standard keyword args to Plotly.
-    st.plotly_chart(fig, use_container_width=True,
-                    config={"displaylogo": False})
+    st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
 
 
 # UI: Sidebar
@@ -431,8 +509,8 @@ with tab_overview:
         cols[i % 4].metric(ticker, f"{row:.2f}%")
 
     st.subheader("Variation")
-    plot_indexed_plotly(norm, st.session_state.transactions,
-                        height=chart_height)
+    buys_list, sells_list = split_buys_sells_lists(st.session_state.transactions)
+    plot_indexed_plotly(norm, buys_list, sells_list, height=chart_height)
 
     with st.expander("Window performance table"):
         # calculate a reasonable height based on rows so the table doesn't force a small scrollbox
@@ -500,5 +578,6 @@ with tab_single:
         "Period (single)", ["1mo", "3mo", "6mo", "ytd", "1y", "2y"], index=2)
     sub_interval = st.selectbox(
         "Interval (single)", ["1d", "1wk", "1mo"], index=0)
+    buys_list, sells_list = split_buys_sells_lists(st.session_state.transactions)
     plot_candles_plotly(t, period=sub_period, interval=sub_interval,
-                        height=chart_height+140, buys=st.session_state.transactions)
+                        height=chart_height+140, buys=buys_list, sells=sells_list)
