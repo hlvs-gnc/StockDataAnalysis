@@ -1,0 +1,1 @@
+![Project photo](lib/Stonks.jpg)
